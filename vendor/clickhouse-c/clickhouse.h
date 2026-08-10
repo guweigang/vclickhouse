@@ -559,9 +559,9 @@ chc__err_set(chc_err *e, int code, const char *fmt, ...)
     if (!e) return code;
     if (fmt) {
         va_list ap;
-        __builtin_va_start(ap, fmt);
+        va_start(ap, fmt);
         vsnprintf(e->msg, sizeof e->msg, fmt, ap);
-        __builtin_va_end(ap);
+        va_end(ap);
     } else {
         e->msg[0] = '\0';
     }

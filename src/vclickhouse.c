@@ -745,6 +745,15 @@ static uint64_t vch_read_unsigned(const void *ptr, size_t width)
     return 0;
 }
 
+static bool vch_gmtime(time_t value, struct tm *out)
+{
+#ifdef _WIN32
+    return gmtime_s(out, &value) == 0;
+#else
+    return gmtime_r(&value, out) != NULL;
+#endif
+}
+
 static void vch_decimal(vch_buf *b, int64_t value, int scale)
 {
     if (scale <= 0) { vch_buf_printf(b, "%" PRId64, value); return; }
@@ -760,7 +769,7 @@ static void vch_time_value(vch_buf *b, int64_t unix_seconds)
 {
     time_t value = (time_t)unix_seconds;
     struct tm tm_value;
-    if (!gmtime_r(&value, &tm_value)) { vch_buf_printf(b, "%" PRId64, unix_seconds); return; }
+    if (!vch_gmtime(value, &tm_value)) { vch_buf_printf(b, "%" PRId64, unix_seconds); return; }
     char text[40];
     if (strftime(text, sizeof text, "%Y-%m-%d %H:%M:%S", &tm_value)) vch_buf_puts(b, text);
 }
@@ -769,7 +778,7 @@ static void vch_date_value(vch_buf *b, int64_t days)
 {
     time_t value = (time_t)(days * 86400);
     struct tm tm_value;
-    if (!gmtime_r(&value, &tm_value)) { vch_buf_printf(b, "%" PRId64, days); return; }
+    if (!vch_gmtime(value, &tm_value)) { vch_buf_printf(b, "%" PRId64, days); return; }
     char text[20];
     if (strftime(text, sizeof text, "%Y-%m-%d", &tm_value)) vch_buf_puts(b, text);
 }
