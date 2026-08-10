@@ -1,39 +1,83 @@
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200112L
+#else
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
 
 #include "vclickhouse.h"
 
+#ifndef _WIN32
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <inttypes.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+#endif
+
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/time.h>
 #include <time.h>
-#include <unistd.h>
+
+#ifdef VCLICKHOUSE_OPENSSL
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#endif
 
 #define CHC_PROVIDE_STDLIB_ALLOC
 #define CHC_NO_LZ4
 #define CHC_NO_ZSTD
 #define CHC_IMPLEMENTATION
 #include "clickhouse.h"
+#ifdef _WIN32
+#include "clickhouse-winsock-io.h"
+#else
 #include "clickhouse-posix-io.h"
+#endif
+#ifdef VCLICKHOUSE_OPENSSL
+#include "clickhouse-openssl.h"
+#endif
 #include "clickhouse-compression.h"
 #include "clickhouse-client.h"
 
+#ifdef _WIN32
+typedef SOCKET vch_socket;
+#define VCH_INVALID_SOCKET INVALID_SOCKET
+#else
+typedef int vch_socket;
+#define VCH_INVALID_SOCKET (-1)
+#endif
+
 struct vch_conn {
-    int fd;
+    vch_socket socket;
     chc_alloc allocator;
+#ifdef _WIN32
+    chc_winsock_io io_state;
+#else
     chc_posix_io io_state;
+#endif
+#ifdef VCLICKHOUSE_OPENSSL
+    SSL_CTX *ssl_ctx;
+    SSL *ssl;
+    chc_openssl_io ssl_io_state;
+#endif
     chc_io io;
     chc_client *client;
     int active_stream;
+#ifdef _WIN32
+    int winsock_started;
+#endif
 };
 
 struct vch_stream {
@@ -68,7 +112,27 @@ static void vch_chc_error(char *out, size_t cap, const char *prefix, const chc_e
         vch_error(out, cap, "%s: %s", prefix, err ? err->msg : "unknown error");
 }
 
-static int vch_open_socket(const vch_options *opts, char *error, size_t error_len)
+static void vch_close_socket(vch_socket socket)
+{
+    if (socket == VCH_INVALID_SOCKET) return;
+#ifdef _WIN32
+    closesocket(socket);
+#else
+    close(socket);
+#endif
+}
+
+static int vch_last_socket_error(void)
+{
+#ifdef _WIN32
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+static vch_socket vch_open_socket(const vch_options *opts, char *error,
+                                  size_t error_len)
 {
     char port[16];
     snprintf(port, sizeof port, "%u", (unsigned)(opts->port ? opts->port : 9000));
@@ -82,68 +146,249 @@ static int vch_open_socket(const vch_options *opts, char *error, size_t error_le
     const char *host = opts->host && opts->host[0] ? opts->host : "127.0.0.1";
     int gai = getaddrinfo(host, port, &hints, &addresses);
     if (gai != 0) {
+#ifdef _WIN32
+        vch_error(error, error_len, "resolve %s: Winsock error %d", host, gai);
+#else
         vch_error(error, error_len, "resolve %s: %s", host, gai_strerror(gai));
-        return -1;
+#endif
+        return VCH_INVALID_SOCKET;
     }
 
-    int fd = -1;
-    int last_errno = 0;
+    vch_socket socket_handle = VCH_INVALID_SOCKET;
+    int last_error = 0;
     for (struct addrinfo *it = addresses; it; it = it->ai_next) {
-        fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-        if (fd < 0) { last_errno = errno; continue; }
+        socket_handle = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        if (socket_handle == VCH_INVALID_SOCKET) {
+            last_error = vch_last_socket_error();
+            continue;
+        }
         int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        setsockopt(socket_handle, IPPROTO_TCP, TCP_NODELAY,
+#ifdef _WIN32
+                   (const char *) &one, (int) sizeof one);
 
-        int flags = fcntl(fd, F_GETFL, 0);
+        u_long nonblocking = 1;
+        bool timed_connect = opts->connect_timeout_ms > 0 &&
+                             ioctlsocket(socket_handle, FIONBIO,
+                                         &nonblocking) == 0;
+#else
+                   &one, sizeof one);
+
+        int flags = fcntl(socket_handle, F_GETFL, 0);
         bool timed_connect = opts->connect_timeout_ms > 0 && flags >= 0;
-        if (timed_connect) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-        int connected = connect(fd, it->ai_addr, it->ai_addrlen);
-        if (connected != 0 && timed_connect && errno == EINPROGRESS) {
+        if (timed_connect)
+            fcntl(socket_handle, F_SETFL, flags | O_NONBLOCK);
+#endif
+        int connected = connect(socket_handle, it->ai_addr,
+#ifdef _WIN32
+                                (int) it->ai_addrlen);
+        int connect_error = connected == 0 ? 0 : WSAGetLastError();
+        bool connect_in_progress = connect_error == WSAEWOULDBLOCK ||
+                                   connect_error == WSAEINPROGRESS ||
+                                   connect_error == WSAEINVAL;
+#else
+                                it->ai_addrlen);
+        int connect_error = connected == 0 ? 0 : errno;
+        bool connect_in_progress = connect_error == EINPROGRESS;
+#endif
+        if (connected != 0 && timed_connect && connect_in_progress) {
             fd_set write_set;
             FD_ZERO(&write_set);
-            FD_SET(fd, &write_set);
+            FD_SET(socket_handle, &write_set);
             struct timeval timeout = {
                 .tv_sec = opts->connect_timeout_ms / 1000,
                 .tv_usec = (opts->connect_timeout_ms % 1000) * 1000
             };
-            int selected = select(fd + 1, NULL, &write_set, NULL, &timeout);
+            int selected = select(
+#ifdef _WIN32
+                0,
+#else
+                socket_handle + 1,
+#endif
+                NULL, &write_set, NULL, &timeout);
             if (selected > 0) {
                 int socket_error = 0;
-                socklen_t socket_error_len = sizeof socket_error;
-                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
+#ifdef _WIN32
+                int socket_error_len = sizeof socket_error;
+                if (getsockopt(socket_handle, SOL_SOCKET, SO_ERROR,
+                               (char *) &socket_error,
                                &socket_error_len) == 0 && socket_error == 0)
+#else
+                socklen_t socket_error_len = sizeof socket_error;
+                if (getsockopt(socket_handle, SOL_SOCKET, SO_ERROR, &socket_error,
+                               &socket_error_len) == 0 && socket_error == 0)
+#endif
                     connected = 0;
                 else
-                    errno = socket_error ? socket_error : errno;
+                    connect_error = socket_error ? socket_error :
+                                    vch_last_socket_error();
             } else if (selected == 0) {
-                errno = ETIMEDOUT;
+#ifdef _WIN32
+                connect_error = WSAETIMEDOUT;
+#else
+                connect_error = ETIMEDOUT;
+#endif
+            } else {
+                connect_error = vch_last_socket_error();
             }
         }
-        if (timed_connect) fcntl(fd, F_SETFL, flags);
+#ifdef _WIN32
+        if (timed_connect) {
+            u_long blocking = 0;
+            ioctlsocket(socket_handle, FIONBIO, &blocking);
+        }
+#else
+        if (timed_connect) fcntl(socket_handle, F_SETFL, flags);
+#endif
         if (connected == 0) break;
-        last_errno = errno;
-        close(fd);
-        fd = -1;
+        last_error = connect_error;
+        vch_close_socket(socket_handle);
+        socket_handle = VCH_INVALID_SOCKET;
     }
     freeaddrinfo(addresses);
-    if (fd < 0) {
+    if (socket_handle == VCH_INVALID_SOCKET) {
+#ifdef _WIN32
+        vch_error(error, error_len, "connect %s:%s: Winsock error %d", host,
+                  port, last_error ? last_error : WSAECONNREFUSED);
+#else
         vch_error(error, error_len, "connect %s:%s: %s", host, port,
-                  strerror(last_errno ? last_errno : ECONNREFUSED));
-        return -1;
+                  strerror(last_error ? last_error : ECONNREFUSED));
+#endif
+        return VCH_INVALID_SOCKET;
     }
 
+#ifdef _WIN32
+    if (opts->read_timeout_ms > 0) {
+        DWORD timeout = (DWORD) opts->read_timeout_ms;
+        setsockopt(socket_handle, SOL_SOCKET, SO_RCVTIMEO,
+                   (const char *) &timeout, (int) sizeof timeout);
+    }
+    if (opts->write_timeout_ms > 0) {
+        DWORD timeout = (DWORD) opts->write_timeout_ms;
+        setsockopt(socket_handle, SOL_SOCKET, SO_SNDTIMEO,
+                   (const char *) &timeout, (int) sizeof timeout);
+    }
+#else
     struct timeval tv;
     if (opts->read_timeout_ms > 0) {
         tv.tv_sec = opts->read_timeout_ms / 1000;
         tv.tv_usec = (opts->read_timeout_ms % 1000) * 1000;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        setsockopt(socket_handle, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     }
     if (opts->write_timeout_ms > 0) {
         tv.tv_sec = opts->write_timeout_ms / 1000;
         tv.tv_usec = (opts->write_timeout_ms % 1000) * 1000;
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        setsockopt(socket_handle, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     }
-    return fd;
+#endif
+    return socket_handle;
+}
+
+static int vch_init_transport(vch_conn *conn, const vch_options *opts,
+                              char *error, size_t error_len)
+{
+    if (!opts->secure) {
+#ifdef _WIN32
+        chc_winsock_io_init(&conn->io_state, &conn->io, conn->socket,
+                            NULL, NULL);
+#else
+        chc_posix_io_init(&conn->io_state, &conn->io, conn->socket,
+                          NULL, NULL);
+#endif
+        return 0;
+    }
+
+#ifndef VCLICKHOUSE_OPENSSL
+    vch_error(error, error_len,
+              "native TLS requires rebuilding with -d vclickhouse_openssl");
+    return -1;
+#else
+    conn->ssl_ctx = SSL_CTX_new(TLS_client_method());
+    if (!conn->ssl_ctx) {
+        vch_error(error, error_len, "create OpenSSL context failed");
+        return -1;
+    }
+    if (opts->tls_verify) {
+        SSL_CTX_set_verify(conn->ssl_ctx, SSL_VERIFY_PEER, NULL);
+        if (opts->tls_ca_file && opts->tls_ca_file[0]) {
+            if (SSL_CTX_load_verify_locations(conn->ssl_ctx,
+                                              opts->tls_ca_file, NULL) != 1) {
+                vch_error(error, error_len,
+                          "load TLS CA file failed: %s", opts->tls_ca_file);
+                return -1;
+            }
+        } else if (SSL_CTX_set_default_verify_paths(conn->ssl_ctx) != 1) {
+            vch_error(error, error_len,
+                      "load default TLS certificate authorities failed");
+            return -1;
+        }
+    } else {
+        SSL_CTX_set_verify(conn->ssl_ctx, SSL_VERIFY_NONE, NULL);
+    }
+
+    if (opts->tls_cert_file && opts->tls_cert_file[0]) {
+        if (SSL_CTX_use_certificate_chain_file(conn->ssl_ctx,
+                                               opts->tls_cert_file) != 1 ||
+            SSL_CTX_use_PrivateKey_file(conn->ssl_ctx, opts->tls_key_file,
+                                        SSL_FILETYPE_PEM) != 1 ||
+            SSL_CTX_check_private_key(conn->ssl_ctx) != 1) {
+            vch_error(error, error_len, "load TLS client certificate failed");
+            return -1;
+        }
+    }
+
+    conn->ssl = SSL_new(conn->ssl_ctx);
+    if (!conn->ssl) {
+        vch_error(error, error_len, "create OpenSSL connection failed");
+        return -1;
+    }
+    const char *host = opts->host && opts->host[0] ?
+                       opts->host : "127.0.0.1";
+    if (SSL_set_tlsext_host_name(conn->ssl, host) != 1 ||
+        (opts->tls_verify && SSL_set1_host(conn->ssl, host) != 1)) {
+        vch_error(error, error_len, "configure TLS server name failed");
+        return -1;
+    }
+    if (SSL_set_fd(conn->ssl, (int) conn->socket) != 1) {
+        vch_error(error, error_len, "attach TLS socket failed");
+        return -1;
+    }
+    if (SSL_connect(conn->ssl) != 1) {
+        unsigned long code = ERR_peek_last_error();
+        char detail[256] = "TLS handshake failed";
+        if (code) ERR_error_string_n(code, detail, sizeof detail);
+        vch_error(error, error_len, "ClickHouse TLS handshake failed: %s",
+                  detail);
+        return -1;
+    }
+    chc_openssl_io_init(&conn->ssl_io_state, &conn->io, conn->ssl,
+                        NULL, NULL);
+    return 0;
+#endif
+}
+
+static void vch_free_transport(vch_conn *conn)
+{
+    if (!conn) return;
+#ifdef VCLICKHOUSE_OPENSSL
+    if (conn->ssl) {
+        SSL_shutdown(conn->ssl);
+        SSL_free(conn->ssl);
+        conn->ssl = NULL;
+    }
+    if (conn->ssl_ctx) {
+        SSL_CTX_free(conn->ssl_ctx);
+        conn->ssl_ctx = NULL;
+    }
+#endif
+    vch_close_socket(conn->socket);
+    conn->socket = VCH_INVALID_SOCKET;
+#ifdef _WIN32
+    if (conn->winsock_started) {
+        WSACleanup();
+        conn->winsock_started = 0;
+    }
+#endif
 }
 
 vch_conn *vch_connect(const vch_options *opts, char *error, size_t error_len)
@@ -156,18 +401,51 @@ vch_conn *vch_connect(const vch_options *opts, char *error, size_t error_len)
     defaults.database = "default";
     if (!opts) opts = &defaults;
 
-    int fd = vch_open_socket(opts, error, error_len);
-    if (fd < 0) return NULL;
+#ifndef VCLICKHOUSE_OPENSSL
+    if (opts->secure) {
+        vch_error(error, error_len,
+                  "native TLS requires rebuilding with -d vclickhouse_openssl");
+        return NULL;
+    }
+#endif
+
+#ifdef _WIN32
+    WSADATA winsock_data;
+    int winsock_error = WSAStartup(MAKEWORD(2, 2), &winsock_data);
+    if (winsock_error != 0) {
+        vch_error(error, error_len, "initialize Winsock: error %d",
+                  winsock_error);
+        return NULL;
+    }
+#endif
+
+    vch_socket socket_handle = vch_open_socket(opts, error, error_len);
+    if (socket_handle == VCH_INVALID_SOCKET) {
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return NULL;
+    }
 
     vch_conn *conn = calloc(1, sizeof *conn);
     if (!conn) {
-        close(fd);
+        vch_close_socket(socket_handle);
+#ifdef _WIN32
+        WSACleanup();
+#endif
         vch_error(error, error_len, "allocate ClickHouse connection: out of memory");
         return NULL;
     }
-    conn->fd = fd;
+    conn->socket = socket_handle;
+#ifdef _WIN32
+    conn->winsock_started = 1;
+#endif
     conn->allocator = chc_alloc_stdlib();
-    chc_posix_io_init(&conn->io_state, &conn->io, fd, NULL, NULL);
+    if (vch_init_transport(conn, opts, error, error_len) != 0) {
+        vch_free_transport(conn);
+        free(conn);
+        return NULL;
+    }
     chc_client_opts client_opts;
     memset(&client_opts, 0, sizeof client_opts);
     client_opts.client_name = "vclickhouse";
@@ -183,7 +461,7 @@ vch_conn *vch_connect(const vch_options *opts, char *error, size_t error_len)
     int rc = chc_client_init(&conn->client, &client_opts, &conn->allocator, &conn->io, &err);
     if (rc != CHC_OK) {
         vch_chc_error(error, error_len, "ClickHouse handshake failed", &err);
-        close(fd);
+        vch_free_transport(conn);
         free(conn);
         return NULL;
     }
@@ -194,7 +472,7 @@ void vch_close(vch_conn *conn)
 {
     if (!conn) return;
     if (conn->client) chc_client_close(conn->client);
-    if (conn->fd >= 0) close(conn->fd);
+    vch_free_transport(conn);
     free(conn);
 }
 

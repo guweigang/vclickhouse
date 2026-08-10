@@ -58,3 +58,25 @@ fn test_positional_binding_checks_arity() {
 		assert err.msg().contains('too many parameters')
 	}
 }
+
+fn test_tls_client_certificate_requires_matching_key() {
+	connect(Config{
+		tls_cert_file: 'client.crt'
+	}) or {
+		assert err.msg() == 'tls_cert_file and tls_key_file must be configured together'
+		return
+	}
+	assert false
+}
+
+fn test_tls_reports_required_build_flag_before_connecting() {
+	$if !vclickhouse_openssl ? {
+		connect(Config{
+			ssl_mode: .require
+		}) or {
+			assert err.msg() == 'native TLS requires rebuilding with -d vclickhouse_openssl'
+			return
+		}
+		assert false
+	}
+}

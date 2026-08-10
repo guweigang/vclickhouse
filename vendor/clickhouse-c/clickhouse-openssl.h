@@ -40,17 +40,22 @@ typedef struct chc_openssl_io {
 void chc_openssl_io_init(chc_openssl_io *state, chc_io *out_io, SSL *ssl,
                          bool (*check_cancel)(void *), void *cancel_ud);
 
-/* Bound subsequent reads by absolute CLOCK_MONOTONIC microseconds; 0 = none. */
+/* Bound subsequent reads by absolute monotonic microseconds; 0 = none. */
 void chc_openssl_io_set_deadline(chc_openssl_io *state, int64_t deadline_us);
 
 #ifdef CHC_IMPLEMENTATION
 
 #include <errno.h>
 #include <limits.h>
-#include <poll.h>
 #include <stdio.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <poll.h>
 #include <time.h>
+#endif
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -86,9 +91,13 @@ chc__openssl_fail(chc_err *err, int ret, int ssl_err, const char *op)
 static int64_t
 chc__openssl_now_us(void)
 {
+#ifdef _WIN32
+    return (int64_t) GetTickCount64() * 1000;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+#endif
 }
 
 /* Poll underlying fd until readable (or deadline). SSL is on a blocking
@@ -107,7 +116,25 @@ chc__openssl_wait_readable(SSL *ssl, int64_t deadline_us, chc_err *err)
         int64_t now = chc__openssl_now_us();
         if (now >= deadline_us)
             return chc__err_set(err, CHC_ERR_IO, "read timeout");
-        int64_t rem_ms = (deadline_us - now + 999) / 1000;
+        int64_t rem_us = deadline_us - now;
+#ifdef _WIN32
+        struct timeval timeout = {
+            .tv_sec = (long) (rem_us / 1000000),
+            .tv_usec = (long) (rem_us % 1000000),
+        };
+        fd_set read_set;
+        FD_ZERO(&read_set);
+        FD_SET((SOCKET) fd, &read_set);
+        int pr = select(0, &read_set, NULL, NULL, &timeout);
+        if (pr > 0) return CHC_OK;
+        if (pr == 0)
+            return chc__err_set(err, CHC_ERR_IO, "read timeout");
+        int code = WSAGetLastError();
+        if (code == WSAEINTR) continue;
+        return chc__err_set(err, CHC_ERR_IO,
+                            "select(TLS socket): Winsock error %d", code);
+#else
+        int64_t rem_ms = (rem_us + 999) / 1000;
         if (rem_ms > INT_MAX) rem_ms = INT_MAX;
         struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
         int pr = poll(&pfd, 1, (int) rem_ms);
@@ -117,6 +144,7 @@ chc__openssl_wait_readable(SSL *ssl, int64_t deadline_us, chc_err *err)
         if (errno == EINTR) continue;
         return chc__err_set(err, CHC_ERR_IO, "poll(fd=%d): %s",
                             fd, strerror(errno));
+#endif
     }
 }
 
@@ -139,6 +167,9 @@ chc__openssl_read(void *ud, void *buf, size_t len, size_t *out_n, chc_err *err)
         if (e == SSL_ERROR_ZERO_RETURN) { *out_n = 0; return CHC_OK; }
         if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) continue;
         if (e == SSL_ERROR_SYSCALL && errno == EINTR) continue;
+#ifdef _WIN32
+        if (e == SSL_ERROR_SYSCALL && WSAGetLastError() == WSAEINTR) continue;
+#endif
         return chc__openssl_fail(err, n, e, "SSL_read");
     }
 }
@@ -159,6 +190,9 @@ chc__openssl_write(void *ud, const void *buf, size_t len, chc_err *err)
         int e = SSL_get_error(s->ssl, n);
         if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) continue;
         if (e == SSL_ERROR_SYSCALL && errno == EINTR) continue;
+#ifdef _WIN32
+        if (e == SSL_ERROR_SYSCALL && WSAGetLastError() == WSAEINTR) continue;
+#endif
         return chc__openssl_fail(err, n, e, "SSL_write");
     }
     return CHC_OK;

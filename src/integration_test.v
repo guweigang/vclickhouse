@@ -8,12 +8,16 @@ fn integration_config() ?Config {
 		return none
 	}
 	port := strconv.atoi(os.getenv('VCLICKHOUSE_PORT')) or { 9000 }
+	ssl_mode := if os.getenv('VCLICKHOUSE_SSL') == '1' { SslMode.require } else { SslMode.disable }
 	return Config{
-		host:     os.getenv_opt('VCLICKHOUSE_HOST') or { '127.0.0.1' }
-		port:     port
-		user:     os.getenv_opt('VCLICKHOUSE_USER') or { 'default' }
-		password: os.getenv('VCLICKHOUSE_PASSWORD')
-		dbname:   os.getenv_opt('VCLICKHOUSE_DATABASE') or { 'default' }
+		host:        os.getenv_opt('VCLICKHOUSE_HOST') or { '127.0.0.1' }
+		port:        port
+		user:        os.getenv_opt('VCLICKHOUSE_USER') or { 'default' }
+		password:    os.getenv('VCLICKHOUSE_PASSWORD')
+		dbname:      os.getenv_opt('VCLICKHOUSE_DATABASE') or { 'default' }
+		ssl_mode:    ssl_mode
+		tls_verify:  os.getenv('VCLICKHOUSE_TLS_INSECURE') != '1'
+		tls_ca_file: os.getenv('VCLICKHOUSE_TLS_CA_FILE')
 	}
 }
 

@@ -18,6 +18,10 @@ pub:
 	password           string
 	dbname             string = 'default'
 	ssl_mode           SslMode
+	tls_verify         bool = true
+	tls_ca_file        string
+	tls_cert_file      string
+	tls_key_file       string
 	connect_timeout_ms int = 5_000
 	read_timeout_ms    int = 30_000
 	write_timeout_ms   int = 30_000
@@ -38,11 +42,11 @@ mut:
 }
 
 pub fn connect(config Config) !&DB {
-	if config.ssl_mode == .require {
-		return error('native TLS is not implemented yet; use ssl_mode: .disable')
-	}
 	if config.port < 1 || config.port > 65535 {
 		return error('ClickHouse port must be between 1 and 65535')
+	}
+	if (config.tls_cert_file == '') != (config.tls_key_file == '') {
+		return error('tls_cert_file and tls_key_file must be configured together')
 	}
 	user := config.connection_user()
 	opts := C.vch_options{
@@ -54,6 +58,11 @@ pub fn connect(config Config) !&DB {
 		connect_timeout_ms: config.connect_timeout_ms
 		read_timeout_ms:    config.read_timeout_ms
 		write_timeout_ms:   config.write_timeout_ms
+		secure:             if config.ssl_mode == .require { 1 } else { 0 }
+		tls_verify:         if config.tls_verify { 1 } else { 0 }
+		tls_ca_file:        config.tls_ca_file.str
+		tls_cert_file:      config.tls_cert_file.str
+		tls_key_file:       config.tls_key_file.str
 	}
 	mut error_buffer := []u8{len: error_buffer_size}
 	conn := C.vch_connect(&opts, &char(error_buffer.data), error_buffer.len)

@@ -21,6 +21,9 @@ from an empty string. Native ClickHouse types are exposed in `Result.types` and
 - V
 - a C compiler
 
+Plain Native TCP has no third-party runtime dependency. On Windows it uses
+Winsock directly and links only the system `ws2_32` library.
+
 The first release uses uncompressed Native TCP blocks, so it does not add LZ4
 or Zstandard runtime dependencies to applications that link it.
 
@@ -45,6 +48,31 @@ for row in result.rows {
 	println(row.values())
 }
 ```
+
+### TLS
+
+TLS uses V's OpenSSL build configuration and the official
+`clickhouse-openssl.h` I/O backend. Enable it explicitly so ordinary TCP builds
+remain free of OpenSSL dependencies:
+
+```sh
+v -d vclickhouse_openssl run main.v
+```
+
+```v
+mut db := vclickhouse.connect(vclickhouse.Config{
+	host: 'clickhouse.example.com'
+	port: 9440
+	ssl_mode: .require
+	tls_verify: true
+	// Optional; system certificate authorities are used when omitted.
+	tls_ca_file: '/path/to/ca.pem'
+})!
+```
+
+Client certificate authentication is available through `tls_cert_file` and
+`tls_key_file`. When TLS is enabled, OpenSSL's platform libraries must be
+available; they may be linked statically by the application packaging build.
 
 ### Streaming
 
@@ -110,5 +138,6 @@ VCLICKHOUSE_DATABASE=default \
 v test src/integration_test.v
 ```
 
-The current transport is POSIX Native TCP. `ssl_mode: .require` returns an
-explicit unsupported error until the TLS transport is wired in.
+For a TLS endpoint, also set `VCLICKHOUSE_SSL=1`; optionally set
+`VCLICKHOUSE_TLS_CA_FILE` or `VCLICKHOUSE_TLS_INSECURE=1`, and run the test with
+`-d vclickhouse_openssl`.

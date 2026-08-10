@@ -3,6 +3,7 @@ module vclickhouse
 #flag -I @VMODROOT/src
 #flag -I @VMODROOT/vendor/clickhouse-c
 #flag @VMODROOT/src/vclickhouse.c
+#flag windows -l ws2_32
 #include "vclickhouse.h"
 
 struct C.vch_conn {}
@@ -19,6 +20,11 @@ struct C.vch_options {
 	connect_timeout_ms int
 	read_timeout_ms    int
 	write_timeout_ms   int
+	secure             int
+	tls_verify         int
+	tls_ca_file        &char
+	tls_cert_file      &char
+	tls_key_file       &char
 }
 
 fn C.vch_connect(&C.vch_options, &char, usize) &C.vch_conn

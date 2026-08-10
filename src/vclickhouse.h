@@ -16,6 +16,11 @@ typedef struct vch_options {
     int connect_timeout_ms;
     int read_timeout_ms;
     int write_timeout_ms;
+    int secure;
+    int tls_verify;
+    const char *tls_ca_file;
+    const char *tls_cert_file;
+    const char *tls_key_file;
 } vch_options;
 
 vch_conn *vch_connect(const vch_options *opts, char *error, size_t error_len);
