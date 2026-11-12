@@ -34,10 +34,10 @@ pub fn (mut s StreamResult) next() !bool {
 	}
 	mut vals := []?string{cap: s.names.len}
 	for column in 0 .. s.names.len {
-		mut value_len := usize(0)
-		mut is_null := 0
+		mut value_len := uint(0)
+		mut is_null := i32(0)
 		mut error_buffer := []u8{len: error_buffer_size}
-		value := C.vch_stream_cell_text(s.raw, usize(s.block_row), usize(column), &value_len,
+		value := C.vch_stream_cell_text(s.raw, uint(s.block_row), uint(column), &value_len,
 			&is_null, &char(error_buffer.data), error_buffer.len)
 		if is_null != 0 {
 			vals << none
@@ -160,10 +160,10 @@ fn (mut s StreamResult) load_block() !bool {
 
 fn (mut s StreamResult) read_fields(columns int) {
 	for column in 0 .. columns {
-		mut name_len := usize(0)
-		mut type_len := usize(0)
-		name := C.vch_stream_column_name(s.raw, usize(column), &name_len)
-		type_name := C.vch_stream_column_type(s.raw, usize(column), &type_len)
+		mut name_len := uint(0)
+		mut type_len := uint(0)
+		name := C.vch_stream_column_name(s.raw, uint(column), &name_len)
+		type_name := C.vch_stream_column_type(s.raw, uint(column), &type_len)
 		s.names << unsafe { name.vstring_with_len(int(name_len)) }
 		s.types << unsafe { type_name.vstring_with_len(int(type_len)) }
 	}
