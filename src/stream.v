@@ -164,7 +164,8 @@ fn (mut s StreamResult) read_fields(columns int) {
 		mut type_len := uint(0)
 		name := C.vch_stream_column_name(s.raw, uint(column), &name_len)
 		type_name := C.vch_stream_column_type(s.raw, uint(column), &type_len)
-		s.names << unsafe { name.vstring_with_len(int(name_len)) }
-		s.types << unsafe { type_name.vstring_with_len(int(type_len)) }
+		// The native bridge frees this block when it advances to the next one.
+		s.names << unsafe { name.vstring_with_len(int(name_len)).clone() }
+		s.types << unsafe { type_name.vstring_with_len(int(type_len)).clone() }
 	}
 }
